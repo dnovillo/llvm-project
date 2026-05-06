@@ -45,6 +45,7 @@
 #include "llvm/Support/Alignment.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/FormatVariadic.h"
+#include "llvm/Transforms/Utils/ModuleUtils.h"
 #include <cstdint>
 #include <optional>
 
@@ -595,6 +596,18 @@ void CGHLSLRuntime::finishCodeGen() {
   if (LangOpts.NativeHalfType)
     M.setModuleFlag(llvm::Module::ModFlagBehavior::Error, "dx.nativelowprec",
                     1);
+
+  if (LangOpts.HLSLSpvPreserveInterface && T.isSPIRV()) {
+    // Runs before optimization. Keeps Input/Output globals from GlobalDCE.
+    SmallVector<GlobalValue *, 8> InterfaceVars;
+    for (GlobalVariable &GV : M.globals()) {
+      unsigned AS = GV.getAddressSpace();
+      if (AS == 7 || AS == 8) // addrspace 7 = Input, addrspace 8 = Output
+        InterfaceVars.push_back(&GV);
+    }
+    if (!InterfaceVars.empty())
+      appendToCompilerUsed(M, InterfaceVars);
+  }
 
   generateGlobalCtorDtorCalls();
 }
