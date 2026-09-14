@@ -341,6 +341,7 @@ void SPIRVNonSemanticDebugHandler::beginModule(Module *M) {
   DebugTypeFunctionCache.clear();
   DebugOperationCache.clear();
   DebugExpressionCache.clear();
+  ModuleScopeDefinitions.clear();
   GlobalDIEmitted = false;
   GlobalNSDIEnabled = false;
   CurrentMAI = nullptr;
@@ -441,6 +442,11 @@ void SPIRVNonSemanticDebugHandler::prepareModuleOutput(
   // fresh result ID for it now; the same ID is used in emitExtInst() operands.
   if (!MAI.ExtInstSetMap.count(NSSet))
     MAI.ExtInstSetMap[NSSet] = MAI.getNextIDRegister();
+
+  // Types, constants and globals never reach endInstruction(), and this section
+  // is written before every function body, so record them as already emitted.
+  for (const MachineInstr *MI : MAI.getMSInstrs(SPIRV::MB_TypeConstVars))
+    ModuleScopeDefinitions.insert(MI);
 }
 
 void SPIRVNonSemanticDebugHandler::emitMCInst(MCInst &Inst) {
@@ -1337,6 +1343,8 @@ void SPIRVNonSemanticDebugHandler::resetPerFunctionDebugState() {
   DebugFunctionDefinitionEmitted = false;
   LastLineMI = nullptr;
   LastScopeMI = nullptr;
+  EmittedInstructions.clear();
+  DeferredDebugValues.clear();
 }
 
 void SPIRVNonSemanticDebugHandler::preparePerFunctionDebug(
@@ -1392,6 +1400,9 @@ void SPIRVNonSemanticDebugHandler::beginFunctionImpl(
 
 void SPIRVNonSemanticDebugHandler::endFunctionImpl(const MachineFunction *MF) {
   (void)MF;
+  // deferDebugValue() only holds a record whose definition is later in the same
+  // block, and every instruction in that block has now been visited.
+  assert(DeferredDebugValues.empty() && "deferred DebugValue never emitted");
   resetPerFunctionDebugState();
 }
 
@@ -1406,10 +1417,27 @@ void SPIRVNonSemanticDebugHandler::beginInstruction(const MachineInstr *MI) {
   if (!Target)
     return;
 
+  if (MI->isDebugInstr() && deferDebugValue(MI))
+    return;
+
+  // DebugDeclare and DebugValue "cannot come after a 'Merge Instruction'", so
+  // records found between a merge and its terminator are emitted ahead of the
+  // merge, in order.
+  if (*Target != MI) {
+    for (const MachineInstr *Pending = MI->getNextNode();
+         Pending && Pending != *Target; Pending = Pending->getNextNode()) {
+      if (!Pending->isDebugInstr())
+        continue;
+      emitDebugDeclare(Pending);
+      emitDebugValue(Pending);
+    }
+  }
+
   emitDebugScopeForInstruction(*Target);
   emitDebugLineForInstruction(*Target);
 
   emitDebugDeclare(MI);
+  emitDebugValue(MI);
 }
 
 // The register that holds the variable's address in \p MI, or std::nullopt
@@ -1470,10 +1498,80 @@ void SPIRVNonSemanticDebugHandler::emitDebugDeclare(const MachineInstr *MI) {
   if (!StorageReg.isValid())
     return;
 
+  // Emit the source position here, not in the caller, so a record that took an
+  // early return above opens no DebugLine or DebugScope region.
+  emitDebugScopeForInstruction(MI);
+  emitDebugLineForInstruction(MI);
+
   MCRegister VoidTypeReg = getOrEmitOpTypeVoidReg(MAI);
   MCRegister ExtInstSetReg = MAI.getExtInstSetReg(NSSet);
   emitExtInst(SPIRV::NonSemanticExtInst::DebugDeclare, VoidTypeReg,
               ExtInstSetReg, {*VarRegOpt, StorageReg, *ExprRegOpt}, MAI);
+}
+
+// Returns \p MI's location register when \p MI is a direct DBG_VALUE and an
+// instruction with a SPIR-V result id defines that register.
+static std::optional<Register> getDebugValueReg(const MachineInstr &MI) {
+  if (!MI.isNonListDebugValue() || MI.isIndirectDebugValue())
+    return std::nullopt;
+
+  const MachineOperand &Value = MI.getDebugOperand(0);
+  if (!Value.isReg())
+    return std::nullopt;
+
+  Register ValueReg = Value.getReg();
+  if (!ValueReg.isVirtual())
+    return std::nullopt;
+
+  const MachineInstr *Def = MI.getMF()->getRegInfo().getUniqueVRegDef(ValueReg);
+  if (!Def || Def->isPseudo() || Def->isMetaInstruction() ||
+      Def->getNumOperands() == 0 || !Def->getOperand(0).isReg() ||
+      !Def->getOperand(0).isDef() || Def->getOperand(0).getReg() != ValueReg)
+    return std::nullopt;
+
+  return ValueReg;
+}
+
+bool SPIRVNonSemanticDebugHandler::isEmittedDefinition(
+    const MachineInstr *Def) const {
+  return EmittedInstructions.contains(Def) ||
+         ModuleScopeDefinitions.contains(Def);
+}
+
+void SPIRVNonSemanticDebugHandler::emitDebugValue(const MachineInstr *MI) {
+  assert(DebugFunctionDefinitionEmitted &&
+         "DebugFunctionDefinition must be emitted");
+  assert(CurrentMAI && "CurrentMAI must be set");
+
+  std::optional<Register> LocReg = getDebugValueReg(*MI);
+  if (!LocReg)
+    return;
+
+  auto VarRegOpt = lookupOptReg(DebugLocalVariableRegs, MI->getDebugVariable());
+  if (!VarRegOpt)
+    return;
+
+  auto ExprRegOpt = lookupOptReg(DebugExpressionRegs, MI->getDebugExpression());
+  if (!ExprRegOpt)
+    return;
+
+  SPIRV::ModuleAnalysisInfo &MAI = *CurrentMAI;
+  const MachineInstr *Def = MI->getMF()->getRegInfo().getUniqueVRegDef(*LocReg);
+  if (!isEmittedDefinition(Def))
+    return;
+
+  MCRegister ValueReg = MAI.getRegisterAlias(MI->getMF(), *LocReg);
+  if (!ValueReg.isValid())
+    return;
+
+  // See the note in emitDebugDeclare() on emitting the source position here.
+  emitDebugScopeForInstruction(MI);
+  emitDebugLineForInstruction(MI);
+
+  MCRegister VoidTypeReg = getOrEmitOpTypeVoidReg(MAI);
+  MCRegister ExtInstSetReg = MAI.getExtInstSetReg(NSSet);
+  emitExtInst(SPIRV::NonSemanticExtInst::DebugValue, VoidTypeReg, ExtInstSetReg,
+              {*VarRegOpt, ValueReg, *ExprRegOpt}, MAI);
 }
 
 static bool isMergeInstruction(unsigned Opcode) {
@@ -1497,13 +1595,50 @@ static bool isDebugLocTarget(const MachineInstr *MI,
   }
 }
 
+bool SPIRVNonSemanticDebugHandler::deferDebugValue(const MachineInstr *MI) {
+  assert(CurrentMAI && "CurrentMAI must be set");
+
+  std::optional<Register> LocReg = getDebugValueReg(*MI);
+  if (!LocReg || !DebugLocalVariableRegs.contains(MI->getDebugVariable()) ||
+      !DebugExpressionRegs.contains(MI->getDebugExpression()))
+    return false;
+
+  SPIRV::ModuleAnalysisInfo &MAI = *CurrentMAI;
+  if (!MAI.getRegisterAlias(MI->getMF(), *LocReg).isValid())
+    return false;
+
+  const MachineInstr *Def = MI->getMF()->getRegInfo().getUniqueVRegDef(*LocReg);
+  if (isEmittedDefinition(Def))
+    return false;
+
+  // Moving a record across a block boundary changes its program point, and
+  // isDebugLocTarget() rejects definitions with no insertion point after them.
+  if (Def->getParent() != MI->getParent() || !isDebugLocTarget(Def, MAI))
+    return false;
+
+  DeferredDebugValues[Def].push_back(MI);
+  return true;
+}
+
+void SPIRVNonSemanticDebugHandler::emitDeferredDebugValues(
+    const MachineInstr *MI) {
+  auto It = DeferredDebugValues.find(MI);
+  if (It == DeferredDebugValues.end())
+    return;
+
+  // emitDebugValue() emits each record's own DebugLine and DebugScope.
+  for (const MachineInstr *DebugMI : It->second)
+    emitDebugValue(DebugMI);
+  DeferredDebugValues.erase(It);
+}
+
 static const MachineInstr *
 findAdjacentEmittedInstruction(const MachineInstr *MI,
                                SPIRV::ModuleAnalysisInfo &MAI, bool Forward) {
   for (const MachineInstr *Adj = Forward ? MI->getNextNode()
                                          : MI->getPrevNode();
        Adj; Adj = Forward ? Adj->getNextNode() : Adj->getPrevNode()) {
-    if (MAI.getSkipEmission(Adj))
+    if (MAI.getSkipEmission(Adj) || Adj->isDebugInstr())
       continue;
     return Adj;
   }
@@ -1533,6 +1668,10 @@ SPIRVNonSemanticDebugHandler::resolveDebugLocTarget(const MachineInstr *MI) {
     // above skips it.
     MI = findAdjacentEmittedInstruction(MI, MAI, true);
     assert(MI && "Merge instruction must be followed by a terminator");
+    // An engaged std::optional can still hold a null pointer, which the
+    // caller's emptiness check would not catch.
+    if (!MI)
+      return std::nullopt;
   }
 
   return MI;
@@ -1663,8 +1802,17 @@ void SPIRVNonSemanticDebugHandler::endInstruction() {
   const MachineInstr *MI = CurMI;
   CurMI = nullptr;
 
-  if (!MI || !GlobalNSDIEnabled || DebugFunctionDefinitionEmitted || !CurrentMF)
+  if (!MI || !GlobalNSDIEnabled || !CurrentMF)
     return;
+
+  assert(CurrentMAI && "CurrentMAI must be set");
+  if (!MI->isMetaInstruction() && !CurrentMAI->getSkipEmission(MI))
+    EmittedInstructions.insert(MI);
+
+  if (DebugFunctionDefinitionEmitted) {
+    emitDeferredDebugValues(MI);
+    return;
+  }
 
   if (MI != LastFunctionOpVariable)
     return;

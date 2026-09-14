@@ -21,6 +21,7 @@
 #include "MCTargetDesc/SPIRVBaseInfo.h"
 #include "SPIRVModuleAnalysis.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
@@ -48,8 +49,9 @@ class SPIRVSubtarget;
 ///   GlobalNSDIEnabled.
 /// - beginFunctionImpl() prepares per-function DebugFunctionDefinition state.
 /// - endInstruction() emits DebugFunctionDefinition after the last function-
-///   level OpVariable; SPIRVAsmPrinter calls notifyEntryLabelEmitted() after
-///   the synthesized entry OpLabel when there are no OpVariables.
+///   level OpVariable and emits deferred DebugValue records after their value
+///   definitions. SPIRVAsmPrinter calls notifyEntryLabelEmitted() after the
+///   synthesized entry OpLabel when there are no OpVariables.
 /// - endFunctionImpl() resets per-function state.
 class SPIRVNonSemanticDebugHandler : public DebugHandlerBase {
   static constexpr unsigned NSSet = static_cast<unsigned>(
@@ -198,6 +200,18 @@ class SPIRVNonSemanticDebugHandler : public DebugHandlerBase {
   const MachineInstr *LastLineMI = nullptr;
   const MachineInstr *LastScopeMI = nullptr;
 
+  // Non-debug instructions already emitted for the current function.
+  DenseSet<const MachineInstr *> EmittedInstructions;
+
+  // Definitions collected into MB_TypeConstVars, which precedes every function
+  // body. Filled once per module, unlike EmittedInstructions.
+  DenseSet<const MachineInstr *> ModuleScopeDefinitions;
+
+  // DebugValue records that precede their value-defining instruction, keyed by
+  // that instruction.
+  DenseMap<const MachineInstr *, SmallVector<const MachineInstr *>>
+      DeferredDebugValues;
+
 public:
   explicit SPIRVNonSemanticDebugHandler(AsmPrinter &AP);
 
@@ -274,6 +288,8 @@ private:
 
   void emitDebugScopeForInstruction(const MachineInstr *MI);
   void emitDebugLineForInstruction(const MachineInstr *MI);
+  bool deferDebugValue(const MachineInstr *MI);
+  void emitDeferredDebugValues(const MachineInstr *MI);
   void preparePerFunctionDebug(const MachineFunction *MF);
   void tryEmitDebugFunctionDefinition(SPIRV::ModuleAnalysisInfo &MAI);
 
@@ -469,8 +485,33 @@ private:
   /// Emits nothing when \p MI is not such a declare, when the variable has no
   /// \c DebugLocalVariable, when the expression was not lowered, or when the
   /// storage is anything other than an \c OpVariable (an access chain, a
-  /// constant, a function parameter, or a dead alloca with no def at all).
+  /// constant operand, a function parameter, or a dead alloca with no def at
+  /// all).
+  ///
+  /// When it does emit, the record's own \c DebugLine and \c DebugScope are
+  /// emitted first.
   void emitDebugDeclare(const MachineInstr *MI);
+
+  /// Emit \c DebugValue for \p MI when it is a direct \c DBG_VALUE whose
+  /// location register is the result of an already-emitted non-debug
+  /// instruction.
+  ///
+  /// Emits nothing for unavailable or indirect locations, constant operands,
+  /// physical registers, variadic values, instruction references, or values
+  /// whose variable or expression was not emitted at module scope. It also
+  /// emits nothing while the defining instruction is still ahead in the same
+  /// block, where \c deferDebugValue() holds the record until
+  /// \c emitDeferredDebugValues() calls back here.
+  ///
+  /// When it does emit, the record's own \c DebugLine and \c DebugScope are
+  /// emitted first.
+  void emitDebugValue(const MachineInstr *MI);
+
+  /// Whether \p Def has already been written to the output stream, which every
+  /// id a \c DebugValue names must be: NonSemantic.Shader.DebugInfo states
+  /// that "Forward references are not allowed, to be compliant with
+  /// SPV_KHR_non_semantic_info".
+  bool isEmittedDefinition(const MachineInstr *Def) const;
 
   /// Emit \c DebugTypeVector for the vector composite type \p VT.
   ///

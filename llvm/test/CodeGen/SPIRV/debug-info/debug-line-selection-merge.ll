@@ -1,4 +1,7 @@
-; RUN: llc --verify-machineinstrs -O0 -mtriple=spirv64-unknown-unknown --spirv-ext=+SPV_KHR_non_semantic_info %s -o - | FileCheck %s
+; asm-verbose=0 keeps AsmPrinter's ;DEBUG_VALUE: comments out of the output, so
+; the CHECK-NEXT chain around the merge asserts adjacency of SPIR-V
+; instructions rather than of text this backend does not own.
+; RUN: llc --verify-machineinstrs -O0 -mtriple=spirv64-unknown-unknown --asm-verbose=0 --spirv-ext=+SPV_KHR_non_semantic_info %s -o - | FileCheck %s
 ; RUN: %if spirv-tools %{ llc --verify-machineinstrs --spirv-ext=+SPV_KHR_non_semantic_info -O0 -mtriple=spirv64-unknown-unknown %s -o - -filetype=obj | spirv-val %}
 
 ; DebugLine for the branch is emitted before OpSelectionMerge.
@@ -10,6 +13,8 @@
 ; CHECK-DAG: [[PATH:%[0-9]+]] = OpString "{{[/\\]}}src{{[/\\]}}debug-line-selection-merge.c"
 ; CHECK-DAG: [[DS:%[0-9]+]] = OpExtInst [[VOID]] [[EXT]] DebugSource [[PATH]]
 ; CHECK-DAG: [[DF:%[0-9]+]] = OpExtInst [[VOID]] [[EXT]] DebugFunction {{.*}}
+; CHECK-DAG: [[CONDVAR:%[0-9]+]] = OpExtInst [[VOID]] [[EXT]] DebugLocalVariable
+; CHECK-DAG: [[EXPR:%[0-9]+]] = OpExtInst [[VOID]] [[EXT]] DebugExpression{{ *$}}
 ; CHECK-DAG: [[V3:%[0-9]+]] = OpConstant [[I32]] 3{{$}}
 ; CHECK-DAG: [[V4:%[0-9]+]] = OpConstant [[I32]] 4{{$}}
 ; CHECK-DAG: [[V5:%[0-9]+]] = OpConstant [[I32]] 5{{$}}
@@ -28,7 +33,10 @@
 ; CHECK-NEXT: OpExtInst [[VOID]] [[EXT]] DebugFunctionDefinition [[DF]] [[FN]]
 ; CHECK-NEXT: OpExtInst [[VOID]] [[EXT]] DebugScope [[DF]]
 ; CHECK-NEXT: OpExtInst [[VOID]] [[EXT]] DebugLine [[DS]] [[V3]] [[V3]] [[V10]] [[V11]]
-; CHECK-NEXT: OpSLessThan
+; CHECK-NEXT: [[CMP:%[0-9]+]] = OpSLessThan
+; A DebugValue between the merge and branch in MIR is emitted before the merge.
+; CHECK-NEXT: OpExtInst [[VOID]] [[EXT]] DebugLine
+; CHECK-NEXT: OpExtInst [[VOID]] [[EXT]] DebugValue [[CONDVAR]] [[CMP]] [[EXPR]]{{ *$}}
 ; CHECK-NEXT: OpExtInst [[VOID]] [[EXT]] DebugLine [[DS]] [[V99]] [[V99]] [[V50]] [[V51]]
 ; CHECK-NEXT: OpSelectionMerge
 ; CHECK-NEXT: OpBranchConditional
@@ -61,6 +69,7 @@ define spir_func i32 @if_else(i32 %x) !dbg !5 {
 entry:
   %cmp = icmp slt i32 %x, 0, !dbg !8
   call void @llvm.spv.selection.merge.p0(ptr blockaddress(@if_else, %merge), i32 0), !dbg !14
+    #dbg_value(i1 %cmp, !16, !DIExpression(), !14)
   br i1 %cmp, label %then, label %else, !dbg !13
 
 then:
@@ -98,3 +107,5 @@ declare void @llvm.spv.selection.merge.p0(ptr, i32 immarg)
 !12 = !DILocation(line: 9, column: 3, scope: !5)
 !13 = !DILocation(line: 99, column: 50, scope: !5)
 !14 = !DILocation(line: 7, column: 1, scope: !5)
+!15 = !DIBasicType(name: "bool", size: 1, encoding: DW_ATE_boolean)
+!16 = !DILocalVariable(name: "condition", scope: !5, file: !1, line: 7, type: !15)
